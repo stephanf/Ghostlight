@@ -90,7 +90,8 @@ struct AppState {
     /// reports, not only the test route's own forced exhaustion.
     controller_permits: Arc<Semaphore>,
     sessions: Arc<Mutex<AppSessionOwner>>,
-    heimdall: Arc<HeimdallClient>,
+    heimdall: Option<Arc<HeimdallClient>>,
+    local_access: Option<crate::local::LocalAccess>,
     mesh: Option<MeshPublisher>,
     mesh_identity: MeshRuntimeIdentity,
     runtime_health: Option<RuntimeHealthOwner>,
@@ -387,7 +388,8 @@ pub(crate) async fn run(state_root_binding: Option<PathBuf>) -> anyhow::Result<(
         play,
         controller_permits,
         sessions: Arc::new(Mutex::new(sessions)),
-        heimdall,
+        heimdall: Some(heimdall),
+        local_access: None,
         mesh,
         mesh_identity: mesh_identity.clone(),
         revisions,
@@ -464,6 +466,58 @@ pub(crate) async fn run(state_root_binding: Option<PathBuf>) -> anyhow::Result<(
                 detail.unwrap_or_else(|| "fatal signal channel closed".into())
             )
         }
+    }
+}
+
+/// Explicit single-user local host. No discovery, remote identity or managed lease.
+pub(crate) async fn run_local(state_root: PathBuf) -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    let bind = crate::local::local_bind(std::env::var("GHOSTLIGHT_LOCAL_BIND").ok().as_deref())?;
+    for name in [IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, "GAMECULT_IDUNN_RUNTIME_BUNDLE", "GAMECULT_IDUNN_PROCESS_WRITE_LEASE"] {
+        ensure!(std::env::var_os(name).is_none(), "--local cannot use managed runtime configuration");
+    }
+    fs::create_dir_all(&state_root)?;
+    let runtime_root = fs::canonicalize(state_root)?;
+    let service_root = runtime_root.join("service");
+    fs::create_dir_all(&service_root)?;
+    let access = crate::local::LocalAccess::open(&runtime_root)?;
+    let key = runtime_root.join("secrets/session-wrapping.key");
+    crate::local::create_secret(&key)?;
+    let sessions = AppSessionOwner::open(service_root.join("app-sessions-v2.cc"), key)?;
+    let (world, world_owner) = WorldMailbox::open(runtime_root.join("world.cc"))?;
+    let permits = Arc::new(Semaphore::new(configured_controller_concurrency()));
+    let runtime_id = "ghostlight-local";
+    let opened = open_controller(&world, &service_root, runtime_id)
+        .context("local inference configuration is incomplete; see docs/local-development.md")?;
+    let play = open_play(&world, &service_root, opened.inference, &opened.models, opened.play_model, permits.clone())?;
+    let (revisions, _) = broadcast::channel(32);
+    let (fatal, mut failures) = mpsc::unbounded_channel();
+    let state = AppState {
+        consumer: ConsumerPort::new(world.clone()),
+        consumers: Arc::new(ConsumerRegistry::empty()),
+        world,
+        controllers: Some(Arc::new(opened.runner)),
+        play: Some(Arc::new(play)),
+        controller_permits: permits,
+        sessions: Arc::new(Mutex::new(sessions)),
+        heimdall: None,
+        local_access: Some(access),
+        mesh: None,
+        mesh_identity: MeshRuntimeIdentity {
+            runtime_id: runtime_id.into(), service_id: "ghostlight-dungeon".into(), located_service: "local".into(),
+        },
+        runtime_health: None, revisions, fatal,
+        seed_vault_root: seed_vault_root_from_environment(|name| std::env::var_os(name)),
+    };
+    canonical_readiness(&state).await?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!(address = %listener.local_addr()?, "Ghostlight local API serving; bearer token is in state-root/secrets/local-api.token");
+    let app = api_router(state);
+    tokio::select! {
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()) => result.context("local HTTP server stopped"),
+        result = world_owner => { result?; bail!("local world owner stopped") },
+        detail = failures.recv() => bail!("local runtime custody failed: {}", detail.unwrap_or_default()),
+        _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
 
@@ -787,6 +841,9 @@ async fn eve_command(
         ))
         .into_response();
     }
+    if state.local_access.is_some() && matches!(invocation.operation.operation_id.as_str(), "heimdall.auth.begin" | "heimdall.auth.complete" | "app.auth.logout") {
+        return Json(eve::command_result(&invocation, "denied", "Local access uses a bearer token; remove the token file while stopped to rotate it.", None, None, None)).into_response();
+    }
     match invocation.operation.operation_id.as_str() {
         "heimdall.auth.begin" => begin_authentication(&state, invocation).await,
         "heimdall.auth.complete" => complete_authentication(&state, invocation).await,
@@ -809,6 +866,9 @@ async fn eve_command(
 }
 
 async fn begin_authentication(state: &AppState, invocation: EveCommandInvocation) -> Response {
+    let Some(heimdall) = state.heimdall.as_ref() else {
+        return Json(eve::command_result(&invocation, "denied", "Use the local bearer token.", None, None, None)).into_response();
+    };
     let bindings = match unwrap_bindings(&invocation.payload) {
         Ok(bindings) => bindings,
         Err(error) => {
@@ -839,7 +899,7 @@ async fn begin_authentication(state: &AppState, invocation: EveCommandInvocation
         .idempotency_key
         .as_deref()
         .unwrap_or("");
-    match state.heimdall.begin(idempotency).await {
+    match heimdall.begin(idempotency).await {
         Ok(receipt)
             if receipt.status == "pending"
                 && !receipt.handle.is_empty()
@@ -891,6 +951,9 @@ async fn begin_authentication(state: &AppState, invocation: EveCommandInvocation
 }
 
 async fn complete_authentication(state: &AppState, invocation: EveCommandInvocation) -> Response {
+    let Some(heimdall) = state.heimdall.as_ref() else {
+        return Json(eve::command_result(&invocation, "denied", "Use the local bearer token.", None, None, None)).into_response();
+    };
     let bindings = match unwrap_bindings(&invocation.payload) {
         Ok(bindings) => bindings,
         Err(error) => {
@@ -936,7 +999,7 @@ async fn complete_authentication(state: &AppState, invocation: EveCommandInvocat
         .idempotency_key
         .as_deref()
         .unwrap_or("");
-    let completion = match state.heimdall.complete(handle, idempotency).await {
+    let completion = match heimdall.complete(handle, idempotency).await {
         Ok(value) => value,
         Err(error) => {
             return Json(eve::command_result(
@@ -1007,7 +1070,7 @@ async fn adopt_heimdall_completion(
     state: &AppState,
     completion: heimdall::AuthCompletionReceipt,
 ) -> anyhow::Result<AdoptedSession> {
-    let admission = state.heimdall.verify_completion(completion).await?;
+    let admission = state.heimdall.as_ref().context("Heimdall is unavailable in local mode")?.verify_completion(completion).await?;
     let expires_at = admission.refresh_expires_at();
     let token = {
         let mut sessions = state.sessions.lock().await;
@@ -1099,8 +1162,7 @@ async fn logout(
             .into_response();
         }
     };
-    if let Some(session) = remote {
-        let heimdall = state.heimdall.clone();
+    if let (Some(session), Some(heimdall)) = (remote, state.heimdall.clone()) {
         tokio::spawn(async move {
             let idempotency = format!(
                 "logout:{}:{}",
@@ -1896,6 +1958,9 @@ async fn authenticated_principal(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Option<VerifiedPrincipalEvidence> {
+    if let Some(access) = &state.local_access {
+        return crate::app_session::account_for_local_token(access, headers);
+    }
     let raw = cookie_value(headers)?;
     match state
         .sessions
@@ -1936,7 +2001,10 @@ fn session_cookie(raw: &str, expires_at: DateTime<Utc>, now: DateTime<Utc>) -> H
 }
 
 async fn maintain_session_refresh(state: AppState) -> anyhow::Result<()> {
-    run_refresh_loop(&state.sessions, state.heimdall.as_ref()).await
+    match state.heimdall.as_deref() {
+        Some(heimdall) => run_refresh_loop(&state.sessions, heimdall).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// How often the refresh loop scans for sessions due for refresh. Decided
@@ -2603,7 +2671,8 @@ mod tests {
             play: Some(Arc::new(play)),
             controller_permits: Arc::new(Semaphore::new(TEST_CONTROLLER_CONCURRENCY)),
             sessions: Arc::new(Mutex::new(sessions)),
-            heimdall: Arc::new(HeimdallClient::fixture()),
+            heimdall: Some(Arc::new(HeimdallClient::fixture())),
+            local_access: None,
             mesh: Some(mesh),
             mesh_identity,
             runtime_health: None,
@@ -2618,6 +2687,48 @@ mod tests {
             cookie,
             _play_directory: None,
         }
+    }
+
+    #[tokio::test]
+    async fn local_bearer_http_journey_uses_existing_kernel_commands() {
+        let mut fixture = fixture().await;
+        let secrets = tempfile::tempdir().unwrap();
+        fixture.state.local_access = Some(crate::local::LocalAccess::open(secrets.path()).unwrap());
+        fixture.state.heimdall = None;
+        fixture.state.mesh = None;
+        let bytes = fs::read(secrets.path().join("secrets/local-api.token")).unwrap();
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        async fn send(state: &AppState, token: &str, body: Value) -> Value {
+            let response = api_router(state.clone()).oneshot(
+                Request::builder().method("POST").uri("/api/eve/commands")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
+            ).await.unwrap();
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+        }
+        let begin = invocation("world.begin", "ghostlight.world_begin.v1", 0,
+            json!({"title":"Local world", "brief":"A small test world", "subject_label":"Player"}),
+            &uuid::Uuid::new_v4().to_string());
+        let refused = send(&fixture.state, "wrong", begin.clone()).await;
+        assert_eq!(refused["receipt"]["state"], "denied");
+        assert!(current_world(&fixture.state).await.unwrap().is_none());
+        let accepted = send(&fixture.state, &token, begin).await;
+        assert_eq!(accepted["receipt"]["state"], "accepted", "{accepted}");
+        let world = current_world(&fixture.state).await.unwrap().unwrap();
+        assert_eq!(world.owner, PrincipalId::new("ghostlight-local-owner"));
+        assert_eq!(world.phase, WorldPhase::Active);
+        let stale = send(&fixture.state, &token, invocation("world.advance_time", "ghostlight.world_advance_time.v0", 1,
+            json!({"minutes":5}), &uuid::Uuid::new_v4().to_string())).await;
+        assert_eq!(stale["receipt"]["state"], "denied");
+        assert_eq!(current_world(&fixture.state).await.unwrap().unwrap().revision, world.revision);
+        let response = api_router(fixture.state.clone()).oneshot(Request::builder()
+            .uri("/api/eve/surfaces/ghostlight.play")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let surface: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(surface.to_string().contains("world.play"));
+        assert!(tokio::time::timeout(Duration::from_millis(10), maintain_session_refresh(fixture.state.clone())).await.is_err());
     }
 
     /// The daemon's refresh owner serves until it fails: a body that returns

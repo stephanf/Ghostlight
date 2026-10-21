@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 
+/// One mint for both authenticated managed sessions and the explicit local host.
+fn principal_evidence(account: impl Into<String>, expires_at: DateTime<Utc>) -> VerifiedPrincipalEvidence {
+    VerifiedPrincipalEvidence::new(account, expires_at)
+}
+
+pub(crate) fn account_for_local_token(access: &crate::local::LocalAccess, headers: &axum::http::HeaderMap) -> Option<VerifiedPrincipalEvidence> {
+    access.authorizes(headers)?;
+    Some(principal_evidence("ghostlight-local-owner", Utc::now() + chrono::Duration::hours(1)))
+}
+
 const STORE_TYPE: &str = "ghostlight.app_session_store.v2";
 /// `pub(crate)` so the recipe-drift test in `idunn_health.rs` can check the
 /// `app-sessions` state slot's schema against this constant.
@@ -209,7 +219,7 @@ impl AppSessionOwner {
                 .iter()
                 .any(|value| value == "app_access"))
         .then(|| {
-            VerifiedPrincipalEvidence::new(
+            principal_evidence(
                 session.account_subject_hash.clone(),
                 session.access_expires_at,
             )
@@ -657,8 +667,8 @@ mod tests {
 
     /// The library owns `VerifiedPrincipalEvidence` and gives it a public
     /// constructor, so the single-minter rule its private fields used to
-    /// enforce is this one: production mints it in `account_for_cookie` and
-    /// nowhere else, from a live cookie this owner holds custody of. A second
+    /// enforce is this one: production mints it through `principal_evidence` in this module, after
+    /// either a live managed cookie or an explicit local-host token was checked. A second
     /// minter anywhere in Dungeon's production source is a second authority
     /// over who the kernel believes is speaking.
     ///

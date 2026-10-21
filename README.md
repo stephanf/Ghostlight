@@ -6,6 +6,15 @@ proposal against typed world state and admits or refuses it. Places, people,
 knowledge, commitments, and time live in the kernel's journal, not in a model's
 context window, so they survive restarts and long stories.
 
+## Local development in this fork
+
+This fork adds an explicit single-user API host for local development and an
+MCP adapter. It runs without GameCult identity/discovery/deployment services,
+uses a loopback bearer token, and reuses the existing kernel and play commands.
+It requires a configured model service. See [local development](docs/local-development.md)
+for startup, authentication, and the API contract. The browser login flow is
+not part of local mode.
+
 ## What is here
 
 | Part | Path | What it is |
